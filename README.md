@@ -155,21 +155,28 @@ preserved.
 
 ---
 
-## Benchmark Results (Development Split)
+## Benchmark & Experimental Results (Development Split)
 
-### Gemini (`gemini-3.5-flash-lite`, v1 Baseline)
-- **Extraction Precision**: 99.68%
-- **Extraction Recall**: 81.65%
-- **Extraction F1**: 89.77%
-- **Joint Precision**: 96.75%
-- **Joint Recall**: 79.26%
-- **Joint F1**: 87.13%
-- **Macro F1**: 86.68%
+Tested live with **Google Gemini (`gemini-3.5-flash-lite`)** across all 40 development answers (376 reference gold claims):
 
-Per-label performance:
-- **Supported**: Precision 94.96% | Recall 94.17% | F1 94.56%
-- **Contradicted**: Precision 97.30% | Recall 90.00% | F1 93.51%
-- **Unknown**: Precision 98.72% | Recall 56.62% | F1 71.96%
+| Metric | Baseline (v1) | Improved (v2) | Delta ($\Delta$) |
+|---|---|---|---|
+| **Gold Claims ($G$)** | 376 | 376 | — |
+| **Predicted Claims ($P$)** | 308 | 356 | +48 |
+| **Exact Span Matches ($M$)** | 307 | 346 | +39 |
+| **Correct Label Matches ($C$)** | 298 | 342 | +44 |
+| **Extraction Precision** | 99.68% | 97.19% | -2.49% |
+| **Extraction Recall** | 81.65% | 92.02% | **+10.37%** |
+| **Extraction F1** | 89.77% | **94.54%** | **+4.77%** |
+| **Joint Precision** | 96.75% | 96.07% | -0.68% |
+| **Joint Recall** | 79.26% | 90.96% | **+11.70%** |
+| **Joint F1 (Primary Metric)** | 87.13% | **93.44%** | **+6.31%** |
+| **Macro F1** | 86.68% | **93.54%** | **+6.86%** |
+
+### Per-Label Performance Breakdown (v2):
+- **Supported**: Precision 96.52% | Recall 92.50% | **F1: 94.47%**
+- **Contradicted**: Precision 98.21% | Recall 91.67% | **F1: 94.83%**
+- **Unknown**: Precision 93.80% | Recall 88.97% | **F1: 91.32%**
 
 ---
 
