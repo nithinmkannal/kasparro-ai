@@ -22,7 +22,10 @@ import re
 import time
 from typing import Any
 
+from dotenv import load_dotenv
 import openai
+
+load_dotenv()
 
 from .facts import KNOWN_BRANDS, GET_BRAND_FACTS_TOOL, get_brand_facts
 from .prompts import SYSTEM_V1, SYSTEM_V2, user_prompt_v1, user_prompt_v2
@@ -62,7 +65,10 @@ def _make_langfuse() -> Any | None:
         key  = os.environ.get("LANGFUSE_SECRET_KEY", "")
         pk   = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
         host = os.environ.get("LANGFUSE_HOST", "https://cloud.langfuse.com")
-        if key and pk:
+        # Treat placeholder values (containing "...") as unset
+        real_key = key and "..." not in key
+        real_pk  = pk  and "..." not in pk
+        if real_key and real_pk:
             return Langfuse(secret_key=key, public_key=pk, host=host)
     except Exception as exc:
         logger.warning("Langfuse disabled: %s", type(exc).__name__)
@@ -230,6 +236,20 @@ def _is_transient(exc: Exception) -> bool:
     return False
 
 
+def _retry_delay(exc: Exception) -> float:
+    """
+    Return how long to wait before retrying.
+    For rate-limit errors, Groq and Gemini embed wait times in the message
+    e.g. "Please try again in 7.7475s" or "Please retry in 24.698s" — parse if
+    present, else fall back to RETRY_DELAY.
+    """
+    if isinstance(exc, openai.RateLimitError):
+        match = re.search(r"(?:try again|retry)\s+in\s+([\d.]+)s", str(exc), re.IGNORECASE)
+        if match:
+            return min(float(match.group(1)) + 0.5, 65.0)  # add 0.5s buffer, cap at 65s
+    return RETRY_DELAY
+
+
 async def _chat_with_retry(
     client: openai.AsyncOpenAI,
     messages: list[dict],
@@ -242,8 +262,9 @@ async def _chat_with_retry(
             return await _chat_request(client, messages, tools, model)
         except Exception as exc:
             if attempt == 0 and _is_transient(exc):
-                logger.warning("Transient failure (%s), retrying in %.1fs…", exc, RETRY_DELAY)
-                await asyncio.sleep(RETRY_DELAY)
+                delay = _retry_delay(exc)
+                logger.warning("Transient failure (%s), retrying in %.1fs…", type(exc).__name__, delay)
+                await asyncio.sleep(delay)
             else:
                 raise
 
@@ -467,6 +488,36 @@ def _validate_and_parse(
 
 
 # --------------------------------------------------------------------------- #
+#  Provider client factory                                                     #
+# --------------------------------------------------------------------------- #
+# Provider base URLs (all OpenAI-compatible)
+_GROQ_BASE_URL    = "https://api.groq.com/openai/v1"
+_GEMINI_BASE_URL  = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+_PROVIDER_CONFIGS: dict[str, dict] = {
+    "openai": {"env_key": "OPENAI_API_KEY",  "base_url": None},
+    "groq":   {"env_key": "GROQ_API_KEY",    "base_url": _GROQ_BASE_URL},
+    "gemini": {"env_key": "GEMINI_API_KEY",  "base_url": _GEMINI_BASE_URL},
+}
+
+
+def _make_client(provider: str) -> openai.AsyncOpenAI:
+    """Build an AsyncOpenAI-compatible client for the given provider."""
+    cfg = _PROVIDER_CONFIGS.get(provider)
+    if cfg is None:
+        raise ValueError(f"Unknown provider {provider!r}. Choices: {list(_PROVIDER_CONFIGS)}")
+    api_key = os.environ.get(cfg["env_key"])
+    if not api_key:
+        raise RuntimeError(
+            f"Environment variable {cfg['env_key']} is not set for provider {provider!r}"
+        )
+    kwargs: dict = {"api_key": api_key, "max_retries": 0}
+    if cfg["base_url"]:
+        kwargs["base_url"] = cfg["base_url"]
+    return openai.AsyncOpenAI(**kwargs)
+
+
+# --------------------------------------------------------------------------- #
 #  Main agent entry point                                                      #
 # --------------------------------------------------------------------------- #
 async def run_agent(
@@ -479,10 +530,11 @@ async def run_agent(
     run_id: str,
     model: str = "gpt-4o",
     client: openai.AsyncOpenAI | None = None,
+    provider: str = "openai",
 ) -> AnswerResult:
     if client is None:
         # max_retries=0: the SDK must not add hidden retries on top of ours
-        client = openai.AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"], max_retries=0)
+        client = _make_client(provider)
 
     system_prompt = SYSTEM_V1 if version == "v1" else SYSTEM_V2
     user_prompt   = (user_prompt_v1 if version == "v1" else user_prompt_v2)(
@@ -507,7 +559,7 @@ async def run_agent(
         version=version,
         brand_id=brand_id,
         model=model,
-        provider="openai",
+        provider=provider,
     )
 
     start_time = time.monotonic()

@@ -993,9 +993,9 @@ class TestRetryPolicy:
 
     def test_default_client_disables_sdk_hidden_retries(self):
         """Our retry budget must be the only one; SDK max_retries must be 0."""
+        # max_retries=0 lives in _make_client inside executor.py
         src = pathlib.Path(sys.modules["agent.executor"].__file__).read_text()
         assert "max_retries=0" in src
-        assert "max_retries=0" in (ROOT / "run.py").read_text()
 
 
 class TestPayloadHygiene:
@@ -1265,7 +1265,7 @@ class TestRunnerReports:
     def _stub_run_all(run, monkeypatch, gold, mode="oracle"):
         from agent.schema import AnswerResult, ClaimPrediction
 
-        async def fake(answers, version, split, run_id, model, client=None):
+        async def fake(answers, version, split, run_id, model, client=None, **kwargs):
             out = []
             for row in sorted(answers, key=lambda r: r["answer_id"]):
                 aid = row["answer_id"]

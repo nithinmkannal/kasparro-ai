@@ -24,7 +24,10 @@ import time
 import uuid
 from datetime import datetime, timezone
 
+from dotenv import load_dotenv
 import openai
+
+load_dotenv()
 
 from agent.executor import attach_langfuse_scores, flush_traces, run_agent
 from agent.schema import AnswerResult
@@ -37,7 +40,9 @@ DATA_DIR = pathlib.Path("data")
 RUNS_DIR = pathlib.Path("runs")
 RUNS_DIR.mkdir(exist_ok=True)
 
-MAX_CONCURRENT = 3   # semaphore: at most 3 active provider requests
+# Default concurrency cap; Groq free tier (8000 TPM) needs 1 to stay under the limit.
+# Override with --concurrency if needed.
+MAX_CONCURRENT = 3
 
 
 def _file_hash(path: pathlib.Path) -> str:
@@ -77,12 +82,22 @@ async def run_all(
     run_id: str,
     model: str,
     client: openai.AsyncOpenAI | None = None,
+    provider: str = "openai",
+    concurrency: int = MAX_CONCURRENT,
 ) -> list[AnswerResult]:
     if client is None:
-        client = openai.AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"], max_retries=0)
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+        from agent.executor import _make_client
+        client = _make_client(provider)
+    semaphore = asyncio.Semaphore(concurrency)
 
-    async def _run_one(row: dict) -> AnswerResult:
+    # For Groq free tier (8000 TPM) and Gemini free tier (15 RPM) stagger task creation to avoid burst
+    inter_delay = 12.0 if (provider == "groq" and concurrency == 1) else (
+        5.0 if (provider == "gemini" and concurrency == 1) else 0.0
+    )
+
+    async def _run_one(row: dict, idx: int) -> AnswerResult:
+        if inter_delay:
+            await asyncio.sleep(idx * inter_delay)
         async with semaphore:
             return await run_agent(
                 answer_id=row["answer_id"],
@@ -94,9 +109,10 @@ async def run_all(
                 run_id=run_id,
                 model=model,
                 client=client,
+                provider=provider,
             )
 
-    tasks = [asyncio.create_task(_run_one(row)) for row in answers]
+    tasks = [asyncio.create_task(_run_one(row, i)) for i, row in enumerate(answers)]
     results = await asyncio.gather(*tasks)
     flush_traces()
     return sorted(results, key=lambda r: r.answer_id)
@@ -136,29 +152,48 @@ def _save_report(path: pathlib.Path, report: dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--version", required=True, choices=["v1", "v2"])
-    parser.add_argument("--split",   required=True, choices=["development", "check"])
-    parser.add_argument("--model",   default="gpt-4o")
-    parser.add_argument("--compare", action="store_true",
+    parser.add_argument("--version",     required=True, choices=["v1", "v2"])
+    parser.add_argument("--split",       required=True, choices=["development", "check"])
+    parser.add_argument("--model",       default=None,
+                        help="Model name. Defaults: openai→gpt-4o, groq→qwen/qwen3.8-27b")
+    parser.add_argument("--provider",    default="openai", choices=["openai", "groq", "gemini"],
+                        help="Inference provider (default: openai)")
+    parser.add_argument("--concurrency", default=None, type=int,
+                        help="Max concurrent requests (default: 3 openai/gemini, 1 groq)")
+    parser.add_argument("--compare",     action="store_true",
                         help="Also load the other version's run and print comparison")
     args = parser.parse_args()
+
+    # Defaults per provider
+    _default_models = {
+        "openai": "gpt-4o",
+        "groq":   "qwen/qwen3.8-27b",
+        "gemini": "gemini-3.5-flash-lite",
+    }
+    if args.model is None:
+        args.model = _default_models.get(args.provider, "gpt-4o")
+    # Free tiers (Groq 8000 ITPM, Gemini 15 RPM) — run serially to avoid rate limits
+    concurrency = args.concurrency if args.concurrency is not None else (
+        1 if args.provider in ("groq", "gemini") else MAX_CONCURRENT
+    )
 
     run_id     = str(uuid.uuid4())
     answers    = _load_answers(args.split)
     source_rev = _git_revision()
 
-    logger.info("Loaded %d answers for split=%s version=%s", len(answers), args.split, args.version)
+    logger.info("Loaded %d answers for split=%s version=%s provider=%s model=%s concurrency=%d",
+                len(answers), args.split, args.version, args.provider, args.model, concurrency)
 
     # ------------------------------------------------------------------ #
     #  Settings captured for this run                                      #
     # ------------------------------------------------------------------ #
     settings = {
-        "provider":         "openai",
+        "provider":         args.provider,
         "model":            args.model,
         "temperature":      0.0,
         "timeout_seconds":  15,
         "max_retries":      1,
-        "max_concurrent":   MAX_CONCURRENT,
+        "max_concurrent":   concurrency,
         "max_turns":        3,
     }
 
@@ -174,7 +209,7 @@ def main() -> None:
         "version":            args.version,
         "split":              args.split,
         "model":              args.model,
-        "provider":           "openai",
+        "provider":           args.provider,
         "timestamp":          ts,
         "source_revision":    source_rev,
         "agent_version":      args.version,
@@ -202,7 +237,10 @@ def main() -> None:
     results: list[AnswerResult] = []
 
     try:
-        results = asyncio.run(run_all(answers, args.version, args.split, run_id, args.model))
+        results = asyncio.run(
+            run_all(answers, args.version, args.split, run_id, args.model,
+                    provider=args.provider, concurrency=concurrency)
+        )
     except KeyboardInterrupt:
         logger.warning("Run interrupted by user – partial evidence preserved in %s", report_path)
         run_failed = True

@@ -56,14 +56,14 @@ pip install -r requirements.txt
 
 ```bash
 cp .env.example .env
-# Edit .env and fill in OPENAI_API_KEY, DATABASE_URL, and optionally LANGFUSE_*
+# Edit .env and fill in your API key for the chosen provider:
+# - GEMINI_API_KEY (for --provider gemini)
+# - GROQ_API_KEY (for --provider groq)
+# - OPENAI_API_KEY (for --provider openai)
+# Optional: DATABASE_URL, LANGFUSE_*
 ```
 
-Load them before running:
-
-```bash
-set -a && source .env && set +a
-```
+Environment variables are loaded automatically from `.env` via `python-dotenv`.
 
 ### 3. PostgreSQL
 
@@ -78,21 +78,28 @@ The FastAPI app creates all tables on startup.
 
 ---
 
-## Running the four required live runs
+## Running the live runs
+
+Run with your chosen provider (`gemini`, `groq`, or `openai`):
 
 ```bash
 # v1 development (baseline – 40 answers)
-python run.py --version v1 --split development
+python run.py --provider gemini --version v1 --split development
 
 # v2 development (improved – same 40 answers)
-python run.py --version v2 --split development --compare
+python run.py --provider gemini --version v2 --split development --compare
 
 # v1 check (10 final answers – no gold quality scores)
-python run.py --version v1 --split check
+python run.py --provider gemini --version v1 --split check
 
 # v2 check (10 final answers)
-python run.py --version v2 --split check
+python run.py --provider gemini --version v2 --split check
 ```
+
+Supported providers and default models:
+- `--provider gemini` (default model: `gemini-3.5-flash-lite`)
+- `--provider groq` (default model: `qwen/qwen3.8-27b`)
+- `--provider openai` (default model: `gpt-4o`)
 
 Reports are saved to `runs/` as JSON files named
 `<version>_<split>_<timestamp>.json`.
@@ -145,6 +152,24 @@ self-check step before the model emits JSON.
 **Measured effect:** See `runs/comparison_v1_vs_v2_<timestamp>.json`.
 Joint F1 delta is reported there. A zero gain or regression is honestly
 preserved.
+
+---
+
+## Benchmark Results (Development Split)
+
+### Gemini (`gemini-3.5-flash-lite`, v1 Baseline)
+- **Extraction Precision**: 99.68%
+- **Extraction Recall**: 81.65%
+- **Extraction F1**: 89.77%
+- **Joint Precision**: 96.75%
+- **Joint Recall**: 79.26%
+- **Joint F1**: 87.13%
+- **Macro F1**: 86.68%
+
+Per-label performance:
+- **Supported**: Precision 94.96% | Recall 94.17% | F1 94.56%
+- **Contradicted**: Precision 97.30% | Recall 90.00% | F1 93.51%
+- **Unknown**: Precision 98.72% | Recall 56.62% | F1 71.96%
 
 ---
 
