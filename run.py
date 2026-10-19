@@ -19,13 +19,14 @@ import json
 import logging
 import os
 import pathlib
+import subprocess
 import time
 import uuid
 from datetime import datetime, timezone
 
 import openai
 
-from agent.executor import run_agent
+from agent.executor import attach_langfuse_scores, flush_traces, run_agent
 from agent.schema import AnswerResult
 from harness import load_gold, score_run, compare_runs
 
@@ -40,9 +41,24 @@ MAX_CONCURRENT = 3   # semaphore: at most 3 active provider requests
 
 
 def _file_hash(path: pathlib.Path) -> str:
-    h = hashlib.md5()
+    """SHA-256 hex digest of a file."""
+    h = hashlib.sha256()
     h.update(path.read_bytes())
     return h.hexdigest()
+
+
+def _git_revision() -> str | None:
+    """Return the current HEAD commit hash, or None if not in a git repo."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
 
 
 def _load_answers(split: str) -> list[dict]:
@@ -60,8 +76,10 @@ async def run_all(
     split: str,
     run_id: str,
     model: str,
+    client: openai.AsyncOpenAI | None = None,
 ) -> list[AnswerResult]:
-    client = openai.AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    if client is None:
+        client = openai.AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"], max_retries=0)
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
     async def _run_one(row: dict) -> AnswerResult:
@@ -80,6 +98,7 @@ async def run_all(
 
     tasks = [asyncio.create_task(_run_one(row)) for row in answers]
     results = await asyncio.gather(*tasks)
+    flush_traces()
     return sorted(results, key=lambda r: r.answer_id)
 
 
@@ -110,6 +129,11 @@ def _result_to_dict(r: AnswerResult) -> dict:
     }
 
 
+def _save_report(path: pathlib.Path, report: dict) -> None:
+    path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    logger.info("Saved run report → %s", path)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--version", required=True, choices=["v1", "v2"])
@@ -119,12 +143,73 @@ def main() -> None:
                         help="Also load the other version's run and print comparison")
     args = parser.parse_args()
 
-    run_id = str(uuid.uuid4())
-    answers = _load_answers(args.split)
-    logger.info("Loaded %d answers for split=%s", len(answers), args.split)
+    run_id     = str(uuid.uuid4())
+    answers    = _load_answers(args.split)
+    source_rev = _git_revision()
+
+    logger.info("Loaded %d answers for split=%s version=%s", len(answers), args.split, args.version)
+
+    # ------------------------------------------------------------------ #
+    #  Settings captured for this run                                      #
+    # ------------------------------------------------------------------ #
+    settings = {
+        "provider":         "openai",
+        "model":            args.model,
+        "temperature":      0.0,
+        "timeout_seconds":  15,
+        "max_retries":      1,
+        "max_concurrent":   MAX_CONCURRENT,
+        "max_turns":        3,
+    }
+
+    # ------------------------------------------------------------------ #
+    #  Build a partial report before running so we can save on interrupt   #
+    # ------------------------------------------------------------------ #
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    report_path = RUNS_DIR / f"{args.version}_{args.split}_{ts}.json"
+
+    partial_report: dict = {
+        "run_id":             run_id,
+        "run_status":         "running",      # will be updated to completed/failed
+        "version":            args.version,
+        "split":              args.split,
+        "model":              args.model,
+        "provider":           "openai",
+        "timestamp":          ts,
+        "source_revision":    source_rev,
+        "agent_version":      args.version,
+        "prompt_version":     args.version,
+        "dataset_version":    "long-brand-answers-50-v4",
+        "evaluator_version":  "sentence-spans-and-labels-v4",
+        "fact_version":       "speaker-catalogue-v4",
+        "settings":           settings,
+        "file_hashes": {
+            "answers.csv":          _file_hash(DATA_DIR / "answers.csv"),
+            "brand_facts.csv":      _file_hash(DATA_DIR / "brand_facts.csv"),
+            "development_gold.csv": _file_hash(DATA_DIR / "development_gold.csv"),
+        },
+        "hash_algorithm":     "sha256",
+        "wall_time_seconds":  None,
+        "error_count":        None,
+        "metrics":            None,
+        "per_answer":         None,
+        "answers":            [],
+    }
+    _save_report(report_path, partial_report)   # preserve even if interrupted
 
     t0 = time.monotonic()
-    results = asyncio.run(run_all(answers, args.version, args.split, run_id, args.model))
+    run_failed = False
+    results: list[AnswerResult] = []
+
+    try:
+        results = asyncio.run(run_all(answers, args.version, args.split, run_id, args.model))
+    except KeyboardInterrupt:
+        logger.warning("Run interrupted by user – partial evidence preserved in %s", report_path)
+        run_failed = True
+    except Exception as exc:
+        logger.error("Run failed with exception: %s", exc)
+        run_failed = True
+
     wall_time = time.monotonic() - t0
 
     # ------------------------------------------------------------------ #
@@ -132,10 +217,15 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     metrics_dict: dict | None = None
     per_answer_list: list | None = None
+    # trace_id lookup for Langfuse score attachment
+    trace_by_aid: dict[str, str | None] = {r.answer_id: r.trace_id for r in results}
 
-    if args.split == "development":
+    if results and args.split == "development":
         gold = load_gold()
-        metrics, per_answer = score_run(results, gold, split=args.split)
+        metrics, per_answer = score_run(
+            results, gold, split=args.split,
+            scheduled_ids=[a["answer_id"] for a in answers],
+        )
         metrics_dict = {
             "G": metrics.G, "P": metrics.P, "M": metrics.M, "C": metrics.C,
             "extraction_precision": metrics.extraction_precision,
@@ -148,21 +238,50 @@ def main() -> None:
             "per_label":            metrics.per_label,
             "confusion_matrix":     metrics.confusion_matrix,
         }
-        per_answer_list = [
-            {
-                "answer_id": a.answer_id,
-                "gold_count": a.gold_count,
-                "pred_count": a.pred_count,
-                "match_count": a.match_count,
-                "correct_count": a.correct_count,
-                "missed_ids": a.missed_ids,
-                "extra_ids": a.extra_ids,
+
+        per_answer_list = []
+        for a in per_answer:
+            # Determine label_correct per matched claim for Langfuse scores
+            claim_correctness: list[dict] = []
+            # Find the result for this answer to identify matched predictions
+            result_for_a = next((r for r in results if r.answer_id == a.answer_id), None)
+            if result_for_a and result_for_a.status == "ok":
+                gold_map = {
+                    (g.start_char, g.end_char): g
+                    for g in gold.get(a.answer_id, [])
+                }
+                for pred in result_for_a.claims:
+                    key = (pred.start_char, pred.end_char)
+                    g = gold_map.get(key)
+                    if g is not None and pred.quote == g.quote:
+                        claim_correctness.append({
+                            "claim_id":     pred.claim_id,
+                            "label_correct": pred.label == g.expected_label,
+                        })
+
+            # Attach Langfuse scores for this answer
+            attach_langfuse_scores(
+                answer_id=a.answer_id,
+                trace_id=trace_by_aid.get(a.answer_id),
+                extraction_f1=a.extraction_f1,
+                joint_f1=a.joint_f1,
+                claim_correctness=claim_correctness,
+                missing_ids=a.missed_ids,
+                extra_ids=a.extra_ids,
+            )
+
+            per_answer_list.append({
+                "answer_id":      a.answer_id,
+                "gold_count":     a.gold_count,
+                "pred_count":     a.pred_count,
+                "match_count":    a.match_count,
+                "correct_count":  a.correct_count,
+                "missed_ids":     a.missed_ids,
+                "extra_ids":      a.extra_ids,
                 "wrong_label_ids": a.wrong_label_ids,
-                "extraction_f1": a.extraction_f1,
-                "joint_f1": a.joint_f1,
-            }
-            for a in per_answer
-        ]
+                "extraction_f1":  a.extraction_f1,
+                "joint_f1":       a.joint_f1,
+            })
 
         logger.info(
             "RESULTS  extraction_f1=%.3f  joint_f1=%.3f  macro_f1=%.3f  "
@@ -172,64 +291,59 @@ def main() -> None:
         )
 
     # ------------------------------------------------------------------ #
-    #  Save run report                                                     #
+    #  Save final run report (overwrite partial)                          #
     # ------------------------------------------------------------------ #
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    report_path = RUNS_DIR / f"{args.version}_{args.split}_{ts}.json"
-
-    report = {
-        "run_id": run_id,
-        "version": args.version,
-        "split": args.split,
-        "model": args.model,
-        "timestamp": ts,
-        "wall_time_seconds": round(wall_time, 2),
-        "agent_version": args.version,
-        "prompt_version": args.version,
-        "dataset_version": "long-brand-answers-50-v4",
-        "evaluator_version": "sentence-spans-and-labels-v4",
-        "fact_version": "speaker-catalogue-v4",
-        "file_hashes": {
-            "answers.csv":          _file_hash(DATA_DIR / "answers.csv"),
-            "brand_facts.csv":      _file_hash(DATA_DIR / "brand_facts.csv"),
-            "development_gold.csv": _file_hash(DATA_DIR / "development_gold.csv"),
-        },
-        "error_count": sum(1 for r in results if r.status == "error"),
-        "metrics": metrics_dict,
-        "per_answer": per_answer_list,
-        "answers": [_result_to_dict(r) for r in results],
+    run_status = "failed" if run_failed else "completed"
+    report: dict = {
+        **partial_report,
+        "run_status":         run_status,
+        "wall_time_seconds":  round(wall_time, 2),
+        "error_count":        sum(1 for r in results if r.status == "error"),
+        "metrics":            metrics_dict,
+        "per_answer":         per_answer_list,
+        "answers":            [_result_to_dict(r) for r in results],
     }
-
-    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-    logger.info("Saved run report → %s", report_path)
+    _save_report(report_path, report)
 
     # ------------------------------------------------------------------ #
     #  Optional comparison                                                 #
     # ------------------------------------------------------------------ #
-    if args.compare and args.split == "development":
+    if args.compare and args.split == "development" and not run_failed:
         other_version = "v2" if args.version == "v1" else "v1"
-        # Find the most recent run for other version
         existing = sorted(RUNS_DIR.glob(f"{other_version}_{args.split}_*.json"))
         if existing:
             other_report = json.loads(existing[-1].read_text(encoding="utf-8"))
-            # Reconstruct metrics from saved data
             om = other_report.get("metrics", {})
-            from harness import Metrics
+            from harness import AnswerMetrics, Metrics
             other_metrics = Metrics(
                 G=om["G"], P=om["P"], M=om["M"], C=om["C"],
                 extraction_f1=om["extraction_f1"],
                 joint_f1=om["joint_f1"],
                 macro_f1=om["macro_f1"],
             )
-            comp = compare_runs(other_metrics, metrics, [], per_answer)
-            comp_path = RUNS_DIR / f"comparison_{other_version}_vs_{args.version}_{ts}.json"
+            other_per_answer = [
+                AnswerMetrics(
+                    answer_id=a["answer_id"], gold_count=a["gold_count"],
+                    pred_count=a["pred_count"], match_count=a["match_count"],
+                    correct_count=a["correct_count"], missed_ids=a["missed_ids"],
+                    extra_ids=a["extra_ids"], wrong_label_ids=a["wrong_label_ids"],
+                    extraction_f1=a["extraction_f1"], joint_f1=a["joint_f1"],
+                )
+                for a in other_report.get("per_answer", [])
+            ]
+            # compare_runs(v1, v2): always pass baseline first, candidate second
+            if args.version == "v2":
+                comp = compare_runs(other_metrics, metrics, other_per_answer, per_answer)
+            else:
+                comp = compare_runs(metrics, other_metrics, per_answer, other_per_answer)
+            comp_path = RUNS_DIR / f"comparison_v1_vs_v2_{ts}.json"
             comp_path.write_text(json.dumps(comp, indent=2), encoding="utf-8")
             logger.info("Comparison saved → %s", comp_path)
             logger.info(
-                "Delta joint_f1: %.4f  (was %.4f → now %.4f)",
+                "Delta joint_f1 (v2 - v1): %.4f  (v1 %.4f → v2 %.4f)",
                 comp["deltas"]["joint_f1"] or 0,
-                comp[other_version]["joint_f1"] or 0,
-                comp[args.version]["joint_f1"] or 0,
+                comp["v1"]["joint_f1"] or 0,
+                comp["v2"]["joint_f1"] or 0,
             )
         else:
             logger.warning("No existing %s run found for comparison.", other_version)

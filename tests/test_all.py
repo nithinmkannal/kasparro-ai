@@ -65,7 +65,12 @@ class TestCSVParsing:
 #  2. SPAN AND QUOTE VALIDATION                                               #
 # =========================================================================== #
 class TestSpanValidation:
-    """Tests for agent/_validate_and_parse logic."""
+    """
+    Tests for agent/_validate_and_parse.
+
+    The new design: the model returns only 'quote'; Python finds the offsets.
+    Payload fields claim_id/start_char/end_char are NOT supplied by the model.
+    """
 
     def _make_valid_payload(self, ai_answer: str, claims: list[dict]) -> str:
         return json.dumps({"answer_id": "A01", "claims": claims})
@@ -77,61 +82,38 @@ class TestSpanValidation:
     def test_valid_span_accepted(self):
         ai = "Hello world."
         payload = self._make_valid_payload(ai, [{
-            "claim_id": "A01:0:12", "start_char": 0, "end_char": 12,
             "quote": "Hello world.", "label": "unknown", "fact_ids": [], "reason": "ok"
         }])
         claims = self._parse(payload, ai)
         assert len(claims) == 1
         assert claims[0].quote == "Hello world."
+        assert claims[0].start_char == 0
+        assert claims[0].end_char == 12
+        assert claims[0].claim_id == "A01:0:12"
 
-    def test_invalid_start_char_raises(self):
+    def test_quote_not_found_raises(self):
+        """A quote that doesn't exist in ai_answer must be rejected."""
         ai = "Hello world."
         payload = json.dumps({"answer_id": "A01", "claims": [{
-            "claim_id": "A01:-1:5", "start_char": -1, "end_char": 5,
-            "quote": "Hello", "label": "unknown", "fact_ids": [], "reason": "ok"
+            "quote": "Not in text at all.", "label": "unknown", "fact_ids": [], "reason": "ok"
         }]})
-        with pytest.raises(ValueError, match="invalid span"):
+        with pytest.raises(ValueError, match="[Qq]uote not found"):
             self._parse(payload, ai)
 
-    def test_end_beyond_length_raises(self):
-        ai = "Hi."
-        payload = json.dumps({"answer_id": "A01", "claims": [{
-            "claim_id": "A01:0:999", "start_char": 0, "end_char": 999,
-            "quote": "Hi.", "label": "unknown", "fact_ids": [], "reason": "ok"
-        }]})
-        with pytest.raises(ValueError, match="invalid span"):
-            self._parse(payload, ai)
-
-    def test_quote_mismatch_raises(self):
+    def test_duplicate_quote_same_location_raises(self):
+        """Two claims with identical quotes resolve to the same span → Duplicate."""
         ai = "Hello world."
-        payload = json.dumps({"answer_id": "A01", "claims": [{
-            "claim_id": "A01:0:12", "start_char": 0, "end_char": 12,
-            "quote": "WRONG", "label": "unknown", "fact_ids": [], "reason": "ok"
-        }]})
-        with pytest.raises(ValueError, match="quote mismatch"):
-            self._parse(payload, ai)
-
-    def test_duplicate_claim_id_raises(self):
-        ai = "Hello world."
-        claim = {
-            "claim_id": "A01:0:12", "start_char": 0, "end_char": 12,
-            "quote": "Hello world.", "label": "unknown", "fact_ids": [], "reason": "ok"
-        }
+        claim = {"quote": "Hello world.", "label": "unknown", "fact_ids": [], "reason": "ok"}
         payload = json.dumps({"answer_id": "A01", "claims": [claim, claim]})
         with pytest.raises(ValueError, match="Duplicate"):
             self._parse(payload, ai)
 
-    def test_overlapping_spans_raises(self):
-        # Use a string where both spans are valid quotes individually,
-        # but the second starts before the first ends → overlap.
+    def test_overlapping_quotes_resolved_to_overlap_raises(self):
+        # "AAABBB" and "BBBCCC" share "BBB" in "AAABBBCCC" → overlap after offset resolution
         ai = "AAABBBCCC"
-        # span1: [0:6) = "AAABBB"
-        # span2: [3:9) = "BBBCCC"  → overlaps with span1
         payload = json.dumps({"answer_id": "A01", "claims": [
-            {"claim_id": "A01:0:6", "start_char": 0, "end_char": 6,
-             "quote": "AAABBB", "label": "unknown", "fact_ids": [], "reason": "ok"},
-            {"claim_id": "A01:3:9", "start_char": 3, "end_char": 9,
-             "quote": "BBBCCC", "label": "unknown", "fact_ids": [], "reason": "ok"},
+            {"quote": "AAABBB", "label": "unknown", "fact_ids": [], "reason": "ok"},
+            {"quote": "BBBCCC", "label": "unknown", "fact_ids": [], "reason": "ok"},
         ]})
         with pytest.raises(ValueError, match="overlaps"):
             self._parse(payload, ai)
@@ -139,7 +121,6 @@ class TestSpanValidation:
     def test_unknown_fact_id_raises(self):
         ai = "Hello world."
         payload = json.dumps({"answer_id": "A01", "claims": [{
-            "claim_id": "A01:0:12", "start_char": 0, "end_char": 12,
             "quote": "Hello world.", "label": "unknown",
             "fact_ids": ["nonexistent.fact"], "reason": "ok"
         }]})
@@ -149,7 +130,6 @@ class TestSpanValidation:
     def test_invalid_label_raises(self):
         ai = "Hello world."
         payload = json.dumps({"answer_id": "A01", "claims": [{
-            "claim_id": "A01:0:12", "start_char": 0, "end_char": 12,
             "quote": "Hello world.", "label": "MAYBE",
             "fact_ids": [], "reason": "ok"
         }]})
@@ -157,20 +137,13 @@ class TestSpanValidation:
             self._parse(payload, ai)
 
     def test_leading_trailing_whitespace_in_quote_raises(self):
-        # ai_answer contains inner text without leading whitespace so span is valid,
-        # but we trim the quote incorrectly (add space) → quote mismatch OR whitespace error.
-        # The validator checks quote == ai_answer[start:end] first, so a quote with
-        # extra space that doesn't match will hit quote mismatch.
-        # To specifically hit the whitespace check, quote must equal the slice but
-        # the slice itself starts/ends with whitespace.
-        ai = " Hello world. "       # 15 chars, starts and ends with space
+        """A quote with leading or trailing whitespace must be rejected."""
+        ai = "Hello world."
         payload = json.dumps({"answer_id": "A01", "claims": [{
-            "claim_id": "A01:1:14", "start_char": 1, "end_char": 14,
-            "quote": "Hello world. ",  # trailing space → whitespace error
+            "quote": " Hello world.",   # leading space → whitespace check
             "label": "unknown",
             "fact_ids": [], "reason": "ok"
         }]})
-        # quote != ai_answer[1:14] → hits quote mismatch first
         with pytest.raises(ValueError):
             self._parse(payload, ai)
 
@@ -406,7 +379,6 @@ class TestFakeProvider:
             self._make_response(content=json.dumps({
                 "answer_id": "A01",
                 "claims": [{
-                    "claim_id": "A01:0:12", "start_char": 0, "end_char": 12,
                     "quote": "Hello world.", "label": "MAYBE",
                     "fact_ids": [], "reason": "ok"
                 }]
@@ -420,7 +392,6 @@ class TestFakeProvider:
             self._make_response(content=json.dumps({
                 "answer_id": "A01",
                 "claims": [{
-                    "claim_id": "A01:0:12", "start_char": 0, "end_char": 12,
                     "quote": "Hello world.", "label": "unknown",
                     "fact_ids": ["totally.made.up.id"], "reason": "ok"
                 }]
@@ -429,36 +400,30 @@ class TestFakeProvider:
         result = await self._run(client)
         assert result.status == "error"
 
-    async def test_illegal_tool_returns_error_to_model(self):
-        """Model requests a non-allowed tool; agent returns error in tool message."""
+    async def test_illegal_tool_is_answer_error(self):
+        """An illegal tool is an answer-level error (spec), never executed."""
         illegal_tc = MagicMock()
         illegal_tc.id = "call_1"
         illegal_tc.function.name = "execute_python"
         illegal_tc.function.arguments = "{}"
 
-        # Turn 1: model requests illegal tool
-        resp1 = self._make_response(tool_calls=[illegal_tc])
-        # Turn 2: model sees error, returns valid empty JSON
-        resp2 = self._make_response(content=self._valid_json())
-
-        client = self._fake_client([resp1, resp2])
+        client = self._fake_client([self._make_response(tool_calls=[illegal_tc])])
         result = await self._run(client)
-        # Agent should NOT crash; model got error message and recovered
-        assert result.status == "ok"
+        assert result.status == "error"
+        assert result.claims == []
+        assert "Illegal tool" in result.error
 
-    async def test_unknown_brand_returns_error_to_model(self):
-        """Model requests get_brand_facts with unknown brand."""
+    async def test_unknown_brand_is_answer_error(self):
+        """An unknown requested brand is an answer-level error (spec)."""
         tc = MagicMock()
         tc.id = "call_2"
         tc.function.name = "get_brand_facts"
         tc.function.arguments = json.dumps({"brand_id": "fakebrand"})
 
-        resp1 = self._make_response(tool_calls=[tc])
-        resp2 = self._make_response(content=self._valid_json())
-
-        client = self._fake_client([resp1, resp2])
+        client = self._fake_client([self._make_response(tool_calls=[tc])])
         result = await self._run(client)
-        assert result.status == "ok"   # model recovered after tool error
+        assert result.status == "error"
+        assert "Unknown brand_id" in result.error
 
     async def test_timeout_creates_error(self):
         import asyncio
@@ -625,6 +590,7 @@ async def test_api_create_run_with_error_answer(test_app):
         "split": "development",
         "model": "gpt-4o",
         "timestamp": "2026-01-01T00:00:00Z",
+        "error_count": 1,
         "answers": [{
             "answer_id": "A01",
             "split": "development",

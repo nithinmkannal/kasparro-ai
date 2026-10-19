@@ -16,7 +16,7 @@ import csv
 import pathlib
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterable
 
 from agent.schema import AnswerResult, ClaimPrediction
 
@@ -71,10 +71,10 @@ def load_gold() -> dict[str, list[GoldClaim]]:
 # --------------------------------------------------------------------------- #
 @dataclass
 class Metrics:
-    G: int = 0   # gold claims
-    P: int = 0   # accepted predictions
-    M: int = 0   # span-matched
-    C: int = 0   # span-matched AND label correct
+    G: int | None = 0   # gold claims          (None for check runs)
+    P: int = 0          # accepted predictions
+    M: int | None = 0   # span-matched         (None for check runs)
+    C: int | None = 0   # matched AND correct  (None for check runs)
 
     extraction_precision: float | None = None
     extraction_recall:    float | None = None
@@ -114,11 +114,36 @@ def score_run(
     results: list[AnswerResult],
     gold_by_answer: dict[str, list[GoldClaim]],
     split: str = "development",
+    scheduled_ids: Iterable[str] | None = None,
 ) -> tuple[Metrics, list[AnswerMetrics]]:
     """
     Score a full run against gold.  Returns aggregate Metrics and per-answer details.
     Only development answers have gold; check answers get null quality metrics.
+
+    Exactly one terminal outcome is required per scheduled answer.  The
+    scheduled set defaults to the answers that have gold claims.  A missing,
+    duplicated or unscheduled outcome raises ValueError.
     """
+    ids = [r.answer_id for r in results]
+    dupes = sorted({i for i in ids if ids.count(i) > 1})
+    if dupes:
+        raise ValueError(f"Duplicate answer outcomes: {dupes}")
+
+    if split == "check":
+        # Reviewer alone holds the key: no G/M/C, no quality metrics, no per-answer scores.
+        return Metrics(
+            G=None, M=None, C=None,
+            P=sum(len(r.claims) for r in results if r.status != "error"),
+        ), []
+
+    expected = set(scheduled_ids) if scheduled_ids is not None else set(gold_by_answer)
+    missing = sorted(expected - set(ids))
+    if missing:
+        raise ValueError(f"Missing answer outcomes: {missing}")
+    unscheduled = sorted(set(ids) - expected)
+    if unscheduled and scheduled_ids is not None:
+        raise ValueError(f"Unscheduled answer outcomes: {unscheduled}")
+
     G_total = 0
     P_total = 0
     M_total = 0
@@ -136,9 +161,6 @@ def score_run(
     cm: dict[str, dict[str, int]] = {r: {c: 0 for c in cm_cols} for r in cm_rows}
 
     per_answer: list[AnswerMetrics] = []
-
-    # Collect all scheduled answer_ids (both errors and successes)
-    scheduled_ids = {r.answer_id for r in results}
 
     for result in sorted(results, key=lambda r: r.answer_id):
         aid = result.answer_id
@@ -163,8 +185,6 @@ def score_run(
             preds = result.claims
             P = len(preds)
 
-            # Build lookup: (start_char, end_char) -> prediction
-            pred_map = {(p.start_char, p.end_char): p for p in preds}
             gold_map = {(g.start_char, g.end_char): g for g in gold_claims}
 
             M = 0
@@ -173,35 +193,36 @@ def score_run(
             extra_ids = []
             wrong_label_ids = []
 
-            matched_gold_keys: set[tuple[int, int]] = set()
-
-            for g in gold_claims:
-                key = (g.start_char, g.end_char)
-                if key in pred_map:
-                    pred = pred_map[key]
-                    M += 1
-                    matched_gold_keys.add(key)
-                    if pred.label == g.expected_label:
-                        C += 1
-                        lbl_tp[g.expected_label] += 1
-                        cm[g.expected_label][g.expected_label] += 1
-                    else:
-                        wrong_label_ids.append(g.claim_id)
-                        lbl_fp[pred.label] += 1
-                        lbl_fn[g.expected_label] += 1
-                        cm[g.expected_label][pred.label] += 1
-                else:
-                    missed_ids.append(g.claim_id)
-                    lbl_fn[g.expected_label] += 1
-                    cm[g.expected_label]["missing_or_error"] += 1
-
-            # Unmatched predictions → extra
+            # Each gold span matches at most one prediction.  Exact answer_id,
+            # start_char and end_char are required, and the quote is checked first.
+            matched_pred_ids: dict[tuple[int, int], ClaimPrediction] = {}
             for p in preds:
                 key = (p.start_char, p.end_char)
-                if key not in {(g.start_char, g.end_char) for g in gold_claims}:
+                g = gold_map.get(key)
+                if g is not None and key not in matched_pred_ids and p.quote == g.quote:
+                    matched_pred_ids[key] = p
+                else:
                     extra_ids.append(p.claim_id)
                     lbl_fp[p.label] += 1
                     cm["no_gold"][p.label] += 1
+
+            for g in gold_claims:
+                pred = matched_pred_ids.get((g.start_char, g.end_char))
+                if pred is None:
+                    missed_ids.append(g.claim_id)
+                    lbl_fn[g.expected_label] += 1
+                    cm[g.expected_label]["missing_or_error"] += 1
+                    continue
+                M += 1
+                if pred.label == g.expected_label:
+                    C += 1
+                    lbl_tp[g.expected_label] += 1
+                    cm[g.expected_label][g.expected_label] += 1
+                else:
+                    wrong_label_ids.append(g.claim_id)
+                    lbl_fp[pred.label] += 1
+                    lbl_fn[g.expected_label] += 1
+                    cm[g.expected_label][pred.label] += 1
 
             P_total += P
             M_total += M
@@ -258,7 +279,8 @@ def score_run(
                            "tp": tp, "fp": fp, "fn": fn}
         macro_f1_sum += f1
     metrics.per_label = per_label
-    metrics.macro_f1  = macro_f1_sum / len(_LABELS) if _LABELS else None
+    # An empty scheduled split has null quality metrics
+    metrics.macro_f1  = macro_f1_sum / len(_LABELS) if (G_total > 0 or P_total > 0) else None
     metrics.confusion_matrix = cm
 
     return metrics, per_answer

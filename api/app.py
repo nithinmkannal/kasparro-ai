@@ -18,11 +18,11 @@ from __future__ import annotations
 import json
 import os
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Literal
 
 import asyncpg
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 
 
 
@@ -111,34 +111,70 @@ app = FastAPI(title="Kasparro Claim Extractor", version="1.0.0", lifespan=lifesp
 # --------------------------------------------------------------------------- #
 class ClaimIn(BaseModel):
     claim_id: str
-    start_char: int
-    end_char: int
+    start_char: int = Field(ge=0)
+    end_char: int = Field(ge=1)
     quote: str
-    label: str
+    label: Literal["supported", "contradicted", "unknown"]
     fact_ids: list[str]
     reason: str
     match_gold: bool | None = None
     label_correct: bool | None = None
 
+    @model_validator(mode="after")
+    def _check_span(self) -> "ClaimIn":
+        if self.start_char >= self.end_char:
+            raise ValueError("start_char must be < end_char")
+        if len(self.quote) != self.end_char - self.start_char:
+            raise ValueError("quote length must equal end_char - start_char")
+        if self.quote != self.quote.strip():
+            raise ValueError("quote must not have leading/trailing whitespace")
+        return self
+
 
 class AnswerResultIn(BaseModel):
     answer_id: str
-    split: str
-    status: str
+    split: Literal["development", "check"]
+    status: Literal["ok", "error"]
     error: str | None = None
-    latency_seconds: float = 0.0
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    model_turns: int = 0
+    latency_seconds: float = Field(default=0.0, ge=0)
+    prompt_tokens: int = Field(default=0, ge=0)
+    completion_tokens: int = Field(default=0, ge=0)
+    model_turns: int = Field(default=0, ge=0, le=3)
     trace_id: str | None = None
     per_answer_metrics: dict | None = None
     claims: list[ClaimIn] = []
 
+    @model_validator(mode="after")
+    def _check_consistency(self) -> "AnswerResultIn":
+        if self.status == "error":
+            if not self.error:
+                raise ValueError("an error answer must carry an error message")
+            if self.claims:
+                raise ValueError("an error answer must have no accepted predictions")
+        elif self.error:
+            raise ValueError("an ok answer must not carry an error message")
+
+        prefix = f"{self.answer_id}:"
+        spans: set[tuple[int, int]] = set()
+        prev_end = -1
+        for c in sorted(self.claims, key=lambda c: (c.start_char, c.end_char)):
+            if c.claim_id != f"{prefix}{c.start_char}:{c.end_char}":
+                raise ValueError(f"claim_id {c.claim_id!r} does not match answer/span")
+            if (c.start_char, c.end_char) in spans:
+                raise ValueError(f"duplicate span {c.claim_id!r}")
+            if c.start_char < prev_end:
+                raise ValueError(f"overlapping span {c.claim_id!r}")
+            spans.add((c.start_char, c.end_char))
+            prev_end = c.end_char
+        return self
+
 
 class RunIn(BaseModel):
-    run_id: str
+    model_config = {"extra": "ignore"}   # forward-compat: ignore new runner fields
+
+    run_id: str = Field(min_length=1)
     version: str
-    split: str
+    split: Literal["development", "check"]
     model: str
     timestamp: str
     dataset_version: str | None = None
@@ -148,9 +184,32 @@ class RunIn(BaseModel):
     file_hashes: dict | None = None
     metrics: dict | None = None
     settings: dict | None = None
-    error_count: int = 0
-    wall_time_seconds: float = 0.0
+    error_count: int = Field(default=0, ge=0)
+    wall_time_seconds: float = Field(default=0.0, ge=0)
     answers: list[AnswerResultIn] = []
+
+    @model_validator(mode="after")
+    def _check_run(self) -> "RunIn":
+        ids = [a.answer_id for a in self.answers]
+        if len(ids) != len(set(ids)):
+            raise ValueError("duplicate answer_id in run")
+        for a in self.answers:
+            if a.split != self.split:
+                raise ValueError(f"answer {a.answer_id} split differs from run split")
+        if self.error_count != sum(1 for a in self.answers if a.status == "error"):
+            raise ValueError("error_count does not match number of error answers")
+        if self.split == "check":
+            if self.metrics and any(
+                self.metrics.get(k) is not None
+                for k in ("extraction_f1", "joint_f1", "macro_f1", "G", "M", "C")
+            ):
+                raise ValueError("check runs must not carry quality metrics")
+            for a in self.answers:
+                if a.per_answer_metrics:
+                    raise ValueError("check runs must not carry per-answer scores")
+                if any(c.match_gold is not None or c.label_correct is not None for c in a.claims):
+                    raise ValueError("check runs must not carry gold match/correctness")
+        return self
 
 
 # --------------------------------------------------------------------------- #
@@ -161,23 +220,25 @@ async def create_run(body: RunIn) -> dict:
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            await conn.execute(
-                """
-                INSERT INTO runs (
-                    run_id, version, split, model, timestamp,
-                    dataset_version, fact_version, evaluator_version, prompt_version,
-                    file_hashes, metrics, settings, error_count, wall_time_seconds
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-                ON CONFLICT (run_id) DO NOTHING
-                """,
-                body.run_id, body.version, body.split, body.model, body.timestamp,
-                body.dataset_version, body.fact_version, body.evaluator_version,
-                body.prompt_version,
-                json.dumps(body.file_hashes) if body.file_hashes else None,
-                json.dumps(body.metrics) if body.metrics else None,
-                json.dumps(body.settings) if body.settings else None,
-                body.error_count, body.wall_time_seconds,
-            )
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO runs (
+                        run_id, version, split, model, timestamp,
+                        dataset_version, fact_version, evaluator_version, prompt_version,
+                        file_hashes, metrics, settings, error_count, wall_time_seconds
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                    """,
+                    body.run_id, body.version, body.split, body.model, body.timestamp,
+                    body.dataset_version, body.fact_version, body.evaluator_version,
+                    body.prompt_version,
+                    json.dumps(body.file_hashes) if body.file_hashes else None,
+                    json.dumps(body.metrics) if body.metrics else None,
+                    json.dumps(body.settings) if body.settings else None,
+                    body.error_count, body.wall_time_seconds,
+                )
+            except asyncpg.UniqueViolationError:
+                raise HTTPException(status_code=409, detail="Run already exists")
 
             for ans in body.answers:
                 await conn.execute(

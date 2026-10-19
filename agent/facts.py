@@ -33,12 +33,12 @@ def get_brand_facts(brand_id: str) -> dict[str, Any]:
     Tool implementation.  Returns the fact rows for brand_id.
     Raises ValueError for unknown brands (tool-level error).
     """
-    if brand_id not in _catalogue:
+    if not isinstance(brand_id, str) or brand_id not in _catalogue:
         raise ValueError(f"Unknown brand_id: {brand_id!r}. Known: {sorted(KNOWN_BRANDS)}")
     return {
         "fact_version": _FACT_VERSION,
         "brand_id": brand_id,
-        "facts": _catalogue[brand_id],
+        "facts": [dict(r) for r in _catalogue[brand_id]],   # copies: callers cannot mutate the catalogue
     }
 
 
